@@ -155,7 +155,23 @@ TCP 拥塞控制、流量卸载都并进了 **LuCI → 网络 → 防火墙 → 
   `::notice::ccache 生效：目录 1.8G`
 - Summary 里同时有一张 ccache 自检表
 
-### 2.11 其它小修
+### 2.11 OpenClash 补内核，运行参数补三个输入
+
+对照 [ImmortalWrt-ImageBuilder](https://github.com/qoolies/ImmortalWrt-ImageBuilder)
+（同一个人的 ImageBuilder 版仓库）补的几处：
+
+1. **OpenClash 内核预置**（`scripts/preset-openclash.sh`）：这个包不含内核也不含
+   GeoIP/GeoSite，光编进去等于装了个壳。现在编译期下好
+   `clash_meta`（`v1` 基线指令集，老 CPU 不会 Illegal instruction）+ GeoIP/GeoSite，
+   塞进 `/etc/openclash/`，刷完即用。下载失败只 `::warning::`，不阻塞编译。
+2. **运行参数变多**：`lan_ip`、`hostname`、`rootfs_mb`（1024–4096）、`preset_openclash`。
+   管理地址/主机名留空就用 `diy-part2.sh` 里的默认值；根分区覆盖走
+   `scripts/gen-config.sh`，不动 `config/base.config`。
+3. **首启脚本 `files/etc/uci-defaults/99-custom`**：主机名/时区兜底（源码层改失败也生效）、
+   SSH 与网页终端放开到所有网口、装了 docker 就补 firewall zone、固件描述打标记。
+   `diy-part2.sh` 会把这次的默认值写成 `/etc/config/edge-settings` 交给它读。
+
+### 2.12 其它小修
 
 - `diy-part1.sh`：`add_feed` / `add_flat_feed` 两个幂等函数，重复执行不会把 feed 写两遍；
   iStore 摊平从「一次性命令」变成「取消注释一行」

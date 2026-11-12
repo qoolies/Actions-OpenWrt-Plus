@@ -30,6 +30,28 @@ on:
         description: "本次临时追加的包，空格分隔（如 luci-app-ttyd；! 前缀表示关闭）"
         required: false
         default: ""
+      lan_ip:
+        description: "路由器管理地址（留空 = 192.168.0.2）"
+        required: false
+        default: ""
+      hostname:
+        description: "主机名（留空 = MyRouter）"
+        required: false
+        default: ""
+      rootfs_mb:
+        description: "根分区大小 MB（覆盖 config/base.config 的 2048）"
+        type: choice
+        required: false
+        default: "2048"
+        options:
+          - "1024"
+          - "2048"
+          - "3072"
+          - "4096"
+      preset_openclash:
+        description: "预置 OpenClash 内核 + GeoIP/GeoSite（选了 openclash 才有意义）"
+        type: boolean
+        default: true
       release:
         description: "构建成功后发布 Release"
         type: boolean
@@ -93,6 +115,10 @@ jobs:
         IN_REPO: ${{ inputs.source_repo }}
         IN_BRANCH: ${{ inputs.source_branch }}
         IN_EXTRA: ${{ inputs.extra_packages }}
+        IN_LAN_IP: ${{ inputs.lan_ip }}
+        IN_HOSTNAME: ${{ inputs.hostname }}
+        IN_ROOTFS: ${{ inputs.rootfs_mb }}
+        IN_PRESET_OC: ${{ inputs.preset_openclash }}
         IN_RELEASE: ${{ inputs.release }}
         IN_CCACHE: ${{ inputs.use_ccache }}
         IN_DEBUG: ${{ inputs.debug_ssh }}
@@ -110,7 +136,13 @@ jobs:
           echo "UPLOAD_RELEASE=$rel"
           echo "USE_CCACHE=$cac"
           echo "DEBUG_SSH=$dbg"
+          echo "ROOTFS_MB=$IN_ROOTFS"
+          echo "PRESET_OPENCLASH=${IN_PRESET_OC:-true}"
         } >> "$GITHUB_ENV"
+
+        # 空的输入不写进环境变量，diy-part2.sh 里的默认值才会生效
+        [ -n "$IN_LAN_IP" ] && echo "LAN_IP=$IN_LAN_IP" >> "$GITHUB_ENV" || true
+        [ -n "$IN_HOSTNAME" ] && echo "ROUTER_HOSTNAME=$IN_HOSTNAME" >> "$GITHUB_ENV" || true
 
         {
           echo "### 本次构建参数"
@@ -119,11 +151,15 @@ jobs:
           echo "|---|---|"
           echo "| 源码 | \`$repo\` @ \`$branch\` |"
           echo "| 临时加包 | \`${IN_EXTRA:-（无）}\` |"
+          echo "| 管理地址 | \`${IN_LAN_IP:-（默认 192.168.0.2）}\` |"
+          echo "| 主机名 | \`${IN_HOSTNAME:-（默认 MyRouter）}\` |"
+          echo "| 根分区 | \`${IN_ROOTFS} MB\` |"
+          echo "| 预置 OpenClash 内核 | ${IN_PRESET_OC:-true} |"
           echo "| ccache | $cac |"
           echo "| 发 Release | $rel |"
           echo ""
         } >> "$GITHUB_STEP_SUMMARY"
-        echo "REPO=$repo  BRANCH=$branch  CCACHE=$cac  RELEASE=$rel"
+        echo "REPO=$repo  BRANCH=$branch  ROOTFS=$IN_ROOTFS  CCACHE=$cac  RELEASE=$rel"
 
     # ---------------------------------------------------------------- 环境
     - name: Initialization environment
@@ -221,6 +257,14 @@ jobs:
         # 机型无关的「改源码」动作（默认 LAN IP / 主机名…）
         cd openwrt
         "$GITHUB_WORKSPACE/$DIY_P2_SH"
+
+    # luci-app-openclash 本身不含内核，也没带 GeoIP/GeoSite；不预置的话
+    # 刷完机能打开页面但启动不了，还得手动点「下载内核」
+    - name: Preset OpenClash core
+      if: env.PRESET_OPENCLASH == 'true'
+      run: |
+        OPENWRT_DIR=openwrt REQ_FILE=/tmp/requested.list \
+          EXTRA_PACKAGES="$EXTRA_PACKAGES" ./scripts/preset-openclash.sh
 
     - name: Pre-check requested packages
       run: |
@@ -466,6 +510,13 @@ jobs:
           echo "- 上游 commit: \`$UPSTREAM_SHA\`"
           echo "- 机型: x86_64 generic（详见 config/base.config）"
           echo "- 构建时间: $(TZ=$TZ date +"%Y-%m-%d %H:%M")"
+          echo ""
+          echo "### 刷完机怎么进后台"
+          echo ""
+          echo "- 地址: <http://${LAN_IP:-192.168.0.2}>"
+          echo "- 用户名 \`root\`，密码为空（进去第一件事改成自己的密码）"
+          echo "- SSH 与网页终端已对所有网口开放"
+          echo "- 加速已在「网络 → 防火墙 → 常规设置」默认开启：全锥形 NAT、软件流量卸载、TCP=BBR"
           echo ""
           echo "### 插件清单（config/packages.txt）"
           echo '```'

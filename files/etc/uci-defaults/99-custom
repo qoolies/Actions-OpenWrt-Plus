@@ -1,0 +1,78 @@
+#!/bin/sh
+#
+# File: files/etc/uci-defaults/99-custom
+# Description: 首次启动的一次性设置（刷完机就生效，之后在 LuCI 里改不会被覆盖）
+#
+# 只做「diy-part2.sh 改源码做不到」的事：
+#   1. 主机名 / 时区兜底 —— diy-part2 是改源码里的默认值，上游换写法时那边会 WARN 跳过
+#   2. SSH / 网页终端对所有网口开放 —— 多网口机器、虚拟机不用再插显示器改
+#   3. 装了 docker 就补 firewall zone —— 否则容器端口穿不出来
+#   4. 固件描述打上本仓库标记，一眼能看出是自编译的哪一版
+#
+# 执行过程写 /etc/config/edge-defaults.log，刷完机 `cat` 它就知道哪步没成。
+
+LOG=/etc/config/edge-defaults.log
+log() { echo "$(date '+%F %T') $*" >>"$LOG"; }
+
+log "99-custom 开始"
+
+# ---------- 1. 主机名 / 时区（兜底）----------
+SETTINGS=/etc/config/edge-settings
+if [ -f "$SETTINGS" ]; then
+    . "$SETTINGS"
+else
+    log "没有 $SETTINGS，用内置默认值"
+fi
+[ -n "${ROUTER_HOSTNAME:-}" ] || ROUTER_HOSTNAME=MyRouter
+[ -n "${ROUTER_TIMEZONE:-}" ] || ROUTER_TIMEZONE=CST-8
+[ -n "${ROUTER_ZONENAME:-}" ] || ROUTER_ZONENAME=Asia/Shanghai
+
+uci -q set system.@system[0].hostname="$ROUTER_HOSTNAME"
+uci -q set system.@system[0].timezone="$ROUTER_TIMEZONE"
+uci -q set system.@system[0].zonename="$ROUTER_ZONENAME"
+uci -q commit system
+log "主机名=$ROUTER_HOSTNAME 时区=$ROUTER_TIMEZONE/$ROUTER_ZONENAME"
+
+# ---------- 2. SSH / 网页终端 对所有网口开放 ----------
+# Interface 设为空 = 监听所有地址（默认只监听 br-lan）
+uci -q set dropbear.@dropbear[0].Interface=''
+uci -q commit dropbear
+# ttyd 去掉 interface 限制
+if uci -q get ttyd.@ttyd[0] >/dev/null 2>&1; then
+    uci -q delete ttyd.@ttyd[0].interface
+    uci -q commit ttyd
+fi
+log "dropbear/ttyd 已放开到所有网口"
+
+# ---------- 3. docker 的防火墙 zone ----------
+if command -v dockerd >/dev/null 2>&1 && ! uci -q get firewall.dockerd >/dev/null 2>&1; then
+    uci -q batch <<EOF
+set firewall.dockerd=zone
+set firewall.dockerd.name='docker'
+set firewall.dockerd.input='ACCEPT'
+set firewall.dockerd.output='ACCEPT'
+set firewall.dockerd.forward='ACCEPT'
+add_list firewall.dockerd.subnet='172.16.0.0/12'
+add firewall.dockerd_lan=forwarding
+set firewall.dockerd_lan.src='docker'
+set firewall.dockerd_lan.dest='lan'
+add firewall.dockerd_wan=forwarding
+set firewall.dockerd_wan.src='docker'
+set firewall.dockerd_wan.dest='wan'
+add firewall.lan_docker=forwarding
+set firewall.lan_docker.src='lan'
+set firewall.lan_docker.dest='docker'
+commit firewall
+EOF
+    log "已为 docker 添加 firewall zone（172.16.0.0/12）"
+else
+    log "没有 dockerd 或 zone 已存在，跳过 docker 防火墙配置"
+fi
+
+# ---------- 4. 固件描述 ----------
+if [ -f /etc/openwrt_release ]; then
+    sed -i "s/DISTRIB_DESCRIPTION='[^']*'/DISTRIB_DESCRIPTION='Self-built by qoolies'/" /etc/openwrt_release
+fi
+
+log "99-custom 结束"
+exit 0

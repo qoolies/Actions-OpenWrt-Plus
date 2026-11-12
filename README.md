@@ -39,6 +39,10 @@
 | `source_repo` | 换源码仓库，留空 = lede |
 | `source_branch` | 分支或 tag，留空 = master。填 tag 可锁定上游版本 |
 | `extra_packages` | 本次临时加包，空格分隔，如 `luci-app-ttyd !luci-app-wol` |
+| `lan_ip` | 路由器管理地址，留空 = `192.168.0.2`（参考 [ImmortalWrt-ImageBuilder](https://github.com/qoolies/ImmortalWrt-ImageBuilder) 的做法：运行参数直接问卷式传入） |
+| `hostname` | 主机名，留空 = `MyRouter` |
+| `rootfs_mb` | 根分区大小，1024/2048/3072/4096，覆盖 `config/base.config` 里的 2048 |
+| `preset_openclash` | 预置 OpenClash 内核 + GeoIP/GeoSite（默认是；选了 openclash 才有意义） |
 | `release` | 构建成功后发 Release（默认否） |
 | `use_ccache` | 使用 ccache（默认是） |
 | `debug_ssh` | 失败时开 tmate SSH 进运行环境（默认否，会挂起 30 分钟） |
@@ -122,6 +126,36 @@ passwall  https://github.com/xiaorouji/openwrt-passwall
 1. 名字拼错了？预检会给近似名
 2. 包在别的仓库？→ 上面这样加 feed
 3. 该分支确实移除了（`luci-app-turboacc` 就是这样消失的，等价功能见「网络加速」一节）→ 删掉这一行
+
+### OpenClash 要内核，包本身不带
+
+`luci-app-openclash` 是个纯 LuCI 包：**没有内核、没有 GeoIP/GeoSite**。只把包编进去，
+刷完机能打开页面但启动不了（提示未检测到内核），得手动点一次「下载内核」。
+
+所以 `preset_openclash: true`（默认）时，编译期会跑 `scripts/preset-openclash.sh`：
+
+| 预置文件 | 来源 | 大小 |
+|---|---|---|
+| `/etc/openclash/core/clash_meta` | [vernesong/OpenClash](https://github.com/vernesong/OpenClash) `core` 分支的 `meta/clash-linux-amd64-v1.tar.gz` | ~16 MB |
+| `/etc/openclash/GeoIP.dat`、`GeoSite.dat` | [Loyalsoldier/v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat) 最新 release | ~27 MB |
+
+要点：用 `v1`（基线 x86-64 指令集）而不是 `v2/v3`，老 CPU 上不会 `Illegal instruction`；
+下载失败**不会**让编译失败，只在 annotation 里 `::warning::`，固件照出、内核留给你手点。
+换 ARM 机型时把脚本里的 `OPENCLASH_ARCH` 改成 `arm64`。
+
+### 和 ImmortalWrt-ImageBuilder 仓库怎么分工
+
+| | 本仓库（从源码编译） | [ImmortalWrt-ImageBuilder](https://github.com/qoolies/ImmortalWrt-ImageBuilder) |
+|---|---|---|
+| 做法 | clone 源码 → feeds → `make` 全量编译 | 官方 `imagebuilder` 镜像 + `make image` 装现成 ipk/apk |
+| 耗时 | 1.5 小时左右 | 10–20 分钟 |
+| 能改 | 源码、内核、任何包 | 只能挑包、塞文件 |
+| 适合 | 要改源码/内核、要精确控制 `.config` | 只是想换插件组合、快速出固件 |
+
+两边可以共用一套「运行参数」的思路：管理地址、主机名、根分区、预装软件都做成
+`workflow_dispatch` 输入，而不是每次改文件。区别是 ImageBuilder 那边把值写成
+`files/etc/config/*.txt` 交给首启脚本读，本仓库一部分在源码层改（`diy-part2.sh`），
+一部分在首启脚本兜底（`files/etc/uci-defaults/99-custom`）。
 
 ### 装 iStore 应用商店
 
@@ -241,5 +275,11 @@ lede master 每天在变。要稳定就钉版本：
   预检的「包的来源」表会列出每个包最终来自哪个源。
 - 当前 lede 的 luci feed 锁在 **openwrt-25.12** 分支：`luci-app-turboacc`、`luci-app-accesscontrol` 在该分支已被移除；
   加速类功能已并入防火墙页面（见「网络加速」一节），不要再去找 `luci-app-turboacc`。
+- **lede 的 `DEFAULT_PACKAGES.router` 里还写着 `luci-app-turboacc`、`luci-app-ssr-plus`**，
+  但这两个包在 luci@25.12 分支已经不存在了，所以是被**静默丢弃**的（不是你漏关）。
+  想知道某个默认包到底有没有进镜像，看 Summary 最后的对账报告，别猜。
+- **iStore 不是 lede 的默认包**（`DEFAULT_PACKAGES.router` 里没有 `luci-app-store`）。
+  本仓库在 `packages.txt` 里显式写了 `!luci-app-store` 做保险；真要用就临时勾
+  `extra_packages` 填 `luci-app-store`，或者按「装 iStore」那节加 feed。
 - **feed 里的包目录是符号链接**：`find package -type d` 看不到它们，脚本里必须用 `find -L`，
   否则「明明装好的包」会被报成找不到。

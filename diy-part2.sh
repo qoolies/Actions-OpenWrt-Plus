@@ -65,4 +65,17 @@ replace_any "$GEN" "zonename='${ROUTER_ZONENAME}'" "默认时区名" "zonename='
 # 打补丁：把 .patch 放进 patch/ 目录，然后在这里 apply
 # patch -p1 < "$GITHUB_WORKSPACE/patches/01-foo.patch"
 
+# ---------- 把这次的默认值交给开机脚本 ----------
+# 上面改的是「源码里的默认值」，开机脚本改的是「已经生成好的 uci 配置」。
+# 两者配合：万一下次上游改了写法、上面某步 WARN 跳过，开机脚本仍然兜得住。
+SETTINGS_DIR="files/etc/config"
+mkdir -p "$SETTINGS_DIR"
+cat >"$SETTINGS_DIR/edge-settings" <<EOF
+LAN_IP='$LAN_IP'
+ROUTER_HOSTNAME='$ROUTER_HOSTNAME'
+ROUTER_TIMEZONE='$ROUTER_TIMEZONE'
+ROUTER_ZONENAME='$ROUTER_ZONENAME'
+EOF
+echo "  ✔ 已写入 $SETTINGS_DIR/edge-settings（供 /etc/uci-defaults/99-custom 使用）"
+
 echo "=== diy-part2.sh 完成 ==="

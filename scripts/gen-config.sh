@@ -63,6 +63,24 @@ else
     echo "::warning::config/base.config 缺失，目标平台会退回源码默认值（大概率不是你要的机型）"
 fi
 
+# ---------- 1.5 本次运行对机器属性的覆盖（workflow_dispatch 输入）----------
+# 分区大小是最常临时改的一项：跑一次 4G 分区试试，不想因此改文件
+if [ -n "${ROOTFS_MB:-}" ]; then
+    case "$ROOTFS_MB" in
+        *[!0-9]*)
+            echo "::warning::ROOTFS_MB=$ROOTFS_MB 不是数字，忽略（继续用 config/base.config 里的值）"
+            ;;
+        *)
+            if grep -q '^CONFIG_TARGET_ROOTFS_PARTSIZE=' "$TMP"; then
+                sed -i "s/^CONFIG_TARGET_ROOTFS_PARTSIZE=.*/CONFIG_TARGET_ROOTFS_PARTSIZE=${ROOTFS_MB}/" "$TMP"
+            else
+                printf 'CONFIG_TARGET_ROOTFS_PARTSIZE=%s\n' "$ROOTFS_MB" >>"$TMP"
+            fi
+            log "分区大小按本次输入改成 ${ROOTFS_MB} MB（覆盖 config/base.config）"
+            ;;
+    esac
+fi
+
 # ---------- 2. 插件清单 ----------
 if [ -f "$CONF_DIR/packages.txt" ]; then
     # 去注释 → 去首尾空白 → 去空行
@@ -140,6 +158,9 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
             echo "| \`config/base.config\` | ⚠️ 缺失 |"
         fi
         echo "| \`config/packages.txt\` | 启用 **$KEEP_Y** 个 / 显式关闭 **$KEEP_N** 个 |"
+        if [ -n "${ROOTFS_MB:-}" ]; then
+            echo "| 本次输入 \`rootfs_mb\` | **${ROOTFS_MB} MB**（覆盖 base.config） |"
+        fi
         echo "| 本次输入 \`extra_packages\` | \`${EXTRA_PACKAGES:-(空)}\` |"
         echo ""
     } >>"$GITHUB_STEP_SUMMARY"

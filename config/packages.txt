@@ -39,6 +39,11 @@ kmod-virtio-net
 # lede 的 DEFAULT_PACKAGES.router 默认带 ssr-plus，会和 openclash 抢 DNS/端口
 !luci-app-ssr-plus
 
+# iStore 应用商店：暂时不要（2026-11 实测 lede master 的 DEFAULT_PACKAGES.router 里并没有它，
+# 这里显式关掉是保险：哪天上游把它塞进默认包、或者你从 extra_packages 里带进来，都会被这行挡住。
+# 包名不存在时预检会把它列在「已请求关闭、但 feed 里本来就没有」里，属正常，忽略即可）
+!luci-app-store
+
 # ===========================================================================
 # 下面这些是「拿不到」的，留作备注，别取消注释（否则只会进「被丢弃」报告）：
 #
