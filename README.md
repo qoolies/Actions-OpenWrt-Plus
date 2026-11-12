@@ -3,7 +3,8 @@
 用 GitHub Actions 编译 **coolsnowwolf/lede** 固件，默认目标是 **x86_64 generic**（PVE 虚拟机 / 软路由）。
 日常只需要改 `config/packages.txt` 这一个文件。
 
-首次构建约 1h50m；开启 ccache 后，第二次起通常 40–70 分钟。
+首次构建实测 **1h46m**（2026-11-12，其中下载依赖 13 分钟、编译 87 分钟）；
+ccache 生效后，第二次起通常 40–70 分钟。
 
 ---
 
@@ -38,12 +39,13 @@
 |---|---|
 | `source_repo` | 换源码仓库，留空 = lede |
 | `source_branch` | 分支或 tag，留空 = master。填 tag 可锁定上游版本 |
+| `source_commit` | 上游 commit（只填前 7 位也行）。填了就钉死这一版 —— **想重现「已经刷上能用」的那份固件就填这里的 SHA**，构建页 Summary 和 Release 正文里都有 |
 | `extra_packages` | 本次临时加包，空格分隔，如 `luci-app-ttyd !luci-app-wol` |
 | `lan_ip` | 路由器管理地址，留空 = `192.168.0.2`（参考 [ImmortalWrt-ImageBuilder](https://github.com/qoolies/ImmortalWrt-ImageBuilder) 的做法：运行参数直接问卷式传入） |
 | `hostname` | 主机名，留空 = `MyRouter` |
 | `rootfs_mb` | 根分区大小，1024/2048/3072/4096，覆盖 `config/base.config` 里的 2048 |
 | `preset_openclash` | 预置 OpenClash 内核 + GeoIP/GeoSite（默认是；选了 openclash 才有意义） |
-| `release` | 构建成功后发 Release（默认否） |
+| `release` | 构建成功后发 Release（默认否）。勾上后固件进 Releases：不用登录也能下、不过期、直接是 `.img.gz`（artifact 是 14 天过期 + zip 套娃） |
 | `use_ccache` | 使用 ccache（默认是） |
 | `debug_ssh` | 失败时开 tmate SSH 进运行环境（默认否，会挂起 30 分钟） |
 
@@ -60,6 +62,8 @@
 3. **包存在性预检** —— ⚠️ 这是新增的关键一步：**编译前 5 秒**告诉你哪些包在 feed 里根本不存在（包名写错、feed 没加、分支已移除）。这种包不会让编译失败，只会「绿勾但固件里没有」
 4. **make defconfig 警告 + 配置解析对账** —— 源码里有、但 `defconfig` 没选中的包（通常是依赖不满足）
 5. **镜像产物 + 对账** —— 逐个检查你请求的包是否真的出现在 `bin/targets` 的包清单里（`bin/packages` 只是编译产物，不代表被装进镜像）
+6. **ccache 自检** —— `CONFIG_DEVEL` / `CONFIG_CCACHE` 两个值、缓存体积、**本次命中率**。
+   命中率是唯一能证明「缓存真的接上了」的数字；`cache_miss` 全量说明这一轮在白跑，看 annotation 里的 `::notice::` / `::warning::`
 
 失败时会额外出现 **失败定位** 块：摘录最后的报错行和涉及的包目录，并直接给出处理建议。
 
@@ -242,10 +246,14 @@ TCP 拥塞控制、流量卸载全部搬进 **LuCI → 网络 → 防火墙 → 
 
 ### 锁定上游版本（防「今天能过明天过不了」）
 
-lede master 每天在变。要稳定就钉版本：
+lede master 每天在变。要稳定就钉版本，三档任选：
 
+- 最省事：`source_commit` 输入框填一个 commit SHA（填 7 位也行）。**这是推荐做法** ——
+  出过一次能用的固件后，把它的 SHA 记下来，以后想重刷/微调插件都填同一个 SHA
 - 懒人版：`source_branch` 输入框填一个 tag
 - 彻底版：把 `.github/workflows/openwrt-builder.yml` 里 `DEFAULT_BRANCH` 改成某个 commit 或 tag
+
+commit 填错（或该 commit 不在这个分支里）会在 10 秒内报错退出，不会白等 90 分钟。
 
 ### 发布 Release
 
@@ -268,6 +276,11 @@ lede master 每天在变。要稳定就钉版本：
 - **`feeds.conf.default` 写错会在 `Update feeds` 一秒内失败**。格式是 `src-git <名字> <URL>[;<分支>]`。
 - **`bin/packages` 不等于装了包**：那只是编译出来的 ipk/apk；判断有没有进固件只看 `bin/targets` 下的清单。
 - **lede 默认主机名是 `LEDE`，不是 `OpenWrt`**，默认时区是 `GMT0`/`UTC`。
+- **`CONFIG_CCACHE=y` 单独写没用，必须配 `CONFIG_DEVEL=y`**：lede 的 `config/Config-devel.in` 里
+  写的是 `config CCACHE` + `bool "Use ccache" if DEVEL` —— 也就是 `DEVEL` 不开时这个符号
+  **不可见**，`make defconfig` 会把那一行直接抹掉，编译照跑、缓存目录永远是空的。
+  （当前 `config/base.config` 里两行是成对出现的；`::notice::ccache 生效：… 命中率 …`
+  才算真的生效。）
 - **ccache 目录不能随便放**：lede 的 `rules.mk` 里是无条件 `export CCACHE_DIR=$(TOPDIR)/.ccache`，
   环境变量会被它覆盖。所以缓存必须放在 `openwrt/.ccache`，放别处就是"配了但每次都全量编译"。
 - **同名包不会互相打架**：`feeds install -a` 是先到先得，`feeds.conf` 里靠前的 feed 优先，

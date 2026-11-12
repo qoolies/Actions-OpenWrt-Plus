@@ -7,6 +7,8 @@
 #      —— 日常只改 packages.txt，不用碰 Kconfig 语法
 #   2. 编译前先做「包存在性预检」（5 秒），把「绿勾但插件没进固件」提前到编译前暴露
 #   3. ccache 缓存（key 绑上游 commit），第二次起只重编改动部分
+#      —— 注意：Kconfig 里 CCACHE 的提示项被 `if DEVEL` 挡着，必须 CONFIG_DEVEL=y
+#         一起写，否则 defconfig 会把 CONFIG_CCACHE 整行抹掉（2026-11-12 踩过）
 #   4. 所有 action 锁大版本；删除旧运行/旧 release 改用 gh API，不再依赖两个已停更的第三方 action
 #   5. 运行参数（源码/分支/临时加包/是否发 release）走 workflow_dispatch 输入，改配置不必改文件
 #
@@ -24,6 +26,10 @@ on:
         default: ""
       source_branch:
         description: "源码分支或 tag（留空 = env.DEFAULT_BRANCH；填 tag 可锁版本）"
+        required: false
+        default: ""
+      source_commit:
+        description: "上游 commit（留空 = 分支最新；填了就钉死这一版，可重现已验证的固件）"
         required: false
         default: ""
       extra_packages:
@@ -53,7 +59,7 @@ on:
         type: boolean
         default: true
       release:
-        description: "构建成功后发布 Release"
+        description: "构建成功后发布 Release（默认否；勾上则固件进 Releases，不用登录也能下、不过期）"
         type: boolean
         default: false
       use_ccache:
@@ -114,6 +120,7 @@ jobs:
       env:
         IN_REPO: ${{ inputs.source_repo }}
         IN_BRANCH: ${{ inputs.source_branch }}
+        IN_COMMIT: ${{ inputs.source_commit }}
         IN_EXTRA: ${{ inputs.extra_packages }}
         IN_LAN_IP: ${{ inputs.lan_ip }}
         IN_HOSTNAME: ${{ inputs.hostname }}
@@ -132,6 +139,7 @@ jobs:
         {
           echo "REPO_URL=$repo"
           echo "REPO_BRANCH=$branch"
+          echo "SOURCE_COMMIT=$IN_COMMIT"
           echo "EXTRA_PACKAGES=$IN_EXTRA"
           echo "UPLOAD_RELEASE=$rel"
           echo "USE_CCACHE=$cac"
@@ -150,6 +158,7 @@ jobs:
           echo "| 项 | 值 |"
           echo "|---|---|"
           echo "| 源码 | \`$repo\` @ \`$branch\` |"
+          echo "| 锁定 commit | \`${IN_COMMIT:-（不锁，跟随分支最新）}\` |"
           echo "| 临时加包 | \`${IN_EXTRA:-（无）}\` |"
           echo "| 管理地址 | \`${IN_LAN_IP:-（默认 192.168.0.2）}\` |"
           echo "| 主机名 | \`${IN_HOSTNAME:-（默认 MyRouter）}\` |"
@@ -159,7 +168,7 @@ jobs:
           echo "| 发 Release | $rel |"
           echo ""
         } >> "$GITHUB_STEP_SUMMARY"
-        echo "REPO=$repo  BRANCH=$branch  ROOTFS=$IN_ROOTFS  CCACHE=$cac  RELEASE=$rel"
+        echo "REPO=$repo  BRANCH=$branch  COMMIT=${IN_COMMIT:-HEAD}  ROOTFS=$IN_ROOTFS  CCACHE=$cac  RELEASE=$rel"
 
     # ---------------------------------------------------------------- 环境
     - name: Initialization environment
@@ -202,10 +211,23 @@ jobs:
     - name: Clone source code
       working-directory: /workdir
       run: |
+        set -euo pipefail
         df -hT "$PWD"
         # --depth 1：只要最新快照，clone 时间从 ~20s 降到 ~5s。
         # 若发现固件里的版本号/描述显示异常，去掉 --depth 1 即可。
         git clone --depth 1 "$REPO_URL" -b "$REPO_BRANCH" openwrt
+        # 钉 commit：把「已经刷过、确认能用」的那一版固定下来，以后重跑能重现同一份固件
+        # （lede master 天天变，不钉的话下周同一个配置可能编不过、或者固件行为变了）
+        if [ -n "${SOURCE_COMMIT:-}" ]; then
+          if git -C openwrt fetch --depth 1 origin "$SOURCE_COMMIT" 2>/dev/null; then
+            git -C openwrt checkout -q --detach FETCH_HEAD
+            echo "::notice::源码已钉在 ${SOURCE_COMMIT}（忽略分支 $REPO_BRANCH 的最新提交）"
+          else
+            # 10 秒内失败，不要白等 90 分钟
+            echo "::error::拉不到 commit ${SOURCE_COMMIT}：拼错了？或者它不在 $REPO_BRANCH 里？"
+            exit 1
+          fi
+        fi
         ln -sf /workdir/openwrt "$GITHUB_WORKSPACE/openwrt"
         echo "UPSTREAM_SHA=$(git -C openwrt rev-parse HEAD)" >> "$GITHUB_ENV"
 
@@ -278,6 +300,21 @@ jobs:
         cd openwrt
         cp .config /tmp/requested.config
         make defconfig 2>&1 | tee /tmp/defconfig.log
+        # ccache 是纯编译期开关（不影响固件内容），但 Kconfig 里它被 `if DEVEL` 挡着，
+        # DEVEL 没开时 defconfig 会把 CONFIG_CCACHE 整行抹掉。真被抹掉就自动补回来再
+        # 跑一次 defconfig —— 这种「只影响速度、不影响正确性」的项，自动修比让整轮
+        # 90 分钟白跑划算。最终到底有没有开，看后面的 ccache 自检 annotation。
+        if [ "${USE_CCACHE:-true}" = "true" ] && ! grep -q '^CONFIG_CCACHE=y' .config; then
+          echo "::warning::make defconfig 抹掉了 CONFIG_CCACHE，自动补 CONFIG_DEVEL=y 再跑一次"
+          sed -i -e '/^CONFIG_DEVEL=/d' .config
+          printf 'CONFIG_DEVEL=y\nCONFIG_CCACHE=y\n' >> .config
+          make defconfig 2>&1 | tee -a /tmp/defconfig.log
+          if grep -q '^CONFIG_CCACHE=y' .config; then
+            echo "::notice::已补上 CONFIG_DEVEL=y + CONFIG_CCACHE=y，本次编译会走 ccache"
+          else
+            echo "::warning::还是没能打开 ccache（上游 Kconfig 又变了？），本次全量编译，不影响固件"
+          fi
+        fi
         {
           echo ""
           echo "### make defconfig 警告"
@@ -301,8 +338,13 @@ jobs:
           echo "### 最终生效的关键项"
           echo ""
           echo '```'
-          grep -E '^CONFIG_TARGET_|^CONFIG_PACKAGE_(luci-app|adguardhome|openclash|tailscale|kmod-virtio)' .config \
-            | head -n 40 || true
+          # 分段打印：CONFIG_TARGET_* 行很多，混在一起会把包和 ccache 开关挤出 head
+          echo "# --- 编译开关（ccache 有没有接上就看这两行）---"
+          grep -E '^CONFIG_(DEVEL|CCACHE)' .config || true
+          echo "# --- 机器属性 ---"
+          grep -E '^CONFIG_TARGET_(x86|ROOTFS|KERNEL_PARTSIZE|IMAGES|SUBTARGET)' .config | head -n 15 || true
+          echo "# --- 包 ---"
+          grep -E '^CONFIG_PACKAGE_(luci-app|adguardhome|openclash|tailscale|kmod-virtio)' .config | head -n 30 || true
           echo '```'
           echo ""
           echo "> lede 的 DEFAULT_PACKAGES.router 自带一批 luci 应用，它们不在你的 packages.txt 里，"
@@ -313,8 +355,9 @@ jobs:
     - name: Download packages
       run: |
         cd openwrt
-        # 上游 mirror 偶发抖动：失败就退回单线程再试一次
-        make download -j8 || make download -j1 || echo "::warning::下载仍有失败项，继续编译（编译期会再取）"
+        # 上游 mirror 偶发抖动：并发调高（IO 密集，比 CPU 数多开几个线程划算），
+        # 失败再退回单线程兜一次。上一次实测这一步 13 分钟，是纯下载耗时。
+        make download -j16 || make download -j1 || echo "::warning::下载仍有失败项，继续编译（编译期会再取）"
         find dl -size -1024c -exec ls -l {} \; || true
         find dl -size -1024c -exec rm -f {} \; || true
 
@@ -323,8 +366,10 @@ jobs:
       run: |
         set -o pipefail
         cd openwrt
-        echo "=== $(nproc) 线程编译 ==="
-        if make -j"$(nproc)" 2>&1 | tee /tmp/build.log; then
+        # nproc+1：编译里总有等 IO/flock 的空档，多开一个线程通常是净收益
+        J=$(( $(nproc) + 1 ))
+        echo "=== ${J} 线程编译（nproc=$(nproc)+1）==="
+        if make -j"$J" 2>&1 | tee /tmp/build.log; then
           echo "并行编译成功"
         else
           echo "::warning::并行编译失败，改用 -j1 V=s 重编，以定位第一个出错的文件"
@@ -363,27 +408,36 @@ jobs:
       if: env.USE_CCACHE == 'true' && !cancelled()
       run: |
         cd openwrt
+        devel="$(grep -E '^CONFIG_DEVEL=' .config || echo '(没有 CONFIG_DEVEL 这一行)')"
         cfg="$(grep -E '^CONFIG_CCACHE=' .config || echo '(没有 CONFIG_CCACHE 这一行)')"
         size="$(du -sh .ccache 2>/dev/null | cut -f1 || true)"
         have=no
         if [ -d .ccache ] && [ -n "$(ls -A .ccache 2>/dev/null)" ]; then have=yes; fi
         echo "have=$have" >> "$GITHUB_OUTPUT"
+
+        # 命中率：ccache 4.x 用 --print-stats（tab 分隔、机器可读），老版本退回 ccache -s
+        stats="$(ccache --print-stats 2>/dev/null || ccache -s 2>/dev/null || true)"
+        hit="$(printf '%s\n' "$stats" | awk -F'\t' '$1=="direct_cache_hit"||$1=="preprocessed_cache_hit"{s+=$2} END{print s+0}')"
+        miss="$(printf '%s\n' "$stats" | awk -F'\t' '$1=="cache_miss"{s+=$2} END{print s+0}')"
+        rate="$(awk -v h="${hit:-0}" -v m="${miss:-0}" 'BEGIN{t=h+m; if(t>0) printf "%.0f%%", h*100/t; else print "n/a"}')"
         {
           echo ""
           echo "### ccache 自检"
           echo ""
           echo "| 项 | 值 |"
           echo "|---|---|"
-          echo "| \`.config\` | \`$cfg\` |"
-          echo "| 目录大小 | ${size:-（目录不存在）} |"
+          echo "| \`.config\` 里的 \`CONFIG_DEVEL\` | \`$devel\` |"
+          echo "| \`.config\` 里的 \`CONFIG_CCACHE\` | \`$cfg\` |"
+          echo "| 缓存目录大小 | ${size:-（目录不存在）} |"
+          echo "| 本次命中 / 未命中 | ${hit:-0} / ${miss:-0}（命中率 ${rate}） |"
           echo ""
         } >> "$GITHUB_STEP_SUMMARY" || true
         if ! grep -q '^CONFIG_CCACHE=y' .config; then
-          echo "::warning::.config 里没有 CONFIG_CCACHE=y（$cfg），ccache 没参与编译：检查 config/base.config"
+          echo "::warning::.config 里没有 CONFIG_CCACHE=y（DEVEL: $devel / CCACHE: $cfg）：ccache 没参与编译。最常见原因是 config/base.config 里少了 CONFIG_DEVEL=y —— lede 的 CCACHE 提示项被 'if DEVEL' 挡着，DEVEL 没开时 defconfig 会把它整行抹掉"
         elif [ "$have" = "no" ]; then
           echo "::warning::CONFIG_CCACHE=y 但 openwrt/.ccache 是空的，没有可保存的缓存（下次还是全量编译）"
         else
-          echo "::notice::ccache 生效：目录 $size，本次结束后存成缓存"
+          echo "::notice::ccache 生效：缓存 $size，本次命中 ${hit:-0} 次 / 未命中 ${miss:-0} 次（命中率 $rate）"
         fi
 
     - name: Save ccache

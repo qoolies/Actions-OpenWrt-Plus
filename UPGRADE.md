@@ -182,6 +182,57 @@ TCP 拥塞控制、流量卸载都并进了 **LuCI → 网络 → 防火墙 → 
 - artifact 保留 14 天、失败日志保留 5 天
 - 运行/Release 清理保留数量可配（`KEEP_RUNS` / `KEEP_RELEASES`）
 
+### 2.13 第一轮真机构建（run 43147063312）暴露的问题
+
+2026-11-12 用这套配置真的编了一轮，**成功**，1h46m（下载 13m + 编译 87m）。
+annotations 只报了两条，一条是好的、一条是 bug：
+
+| annotation | 判定 | 处理 |
+|---|---|---|
+| `::warning::.config 里没有 CONFIG_CCACHE=y` | **真 bug**：87 分钟编译全程没吃到缓存 | 见下 |
+| `::notice::OpenClash 内核已预置（amd64）` | 正常，内核 + GeoIP/GeoSite 都已进固件 | 不用管 |
+
+**ccache 为什么写了 `CONFIG_CCACHE=y` 还是没生效**：lede 的 `config/Config-devel.in` 里是
+
+```text
+config CCACHE
+	bool "Use ccache" if DEVEL
+```
+
+`if DEVEL` 的意思是「DEVEL 打开时这个选项才可见」。Kconfig 对**不可见符号**的处理是
+直接忽略并回落到默认值，于是 `make defconfig` 把 `CONFIG_CCACHE=y` 整行抹掉了 ——
+`rules.mk` 里 `ifneq ($(CONFIG_CCACHE),)` 那段（`TARGET_CC := ccache $(TARGET_CC)`）自然没进，
+编译全量、`.ccache` 空、`Save ccache` 被条件跳过。修法是 `config/base.config` 里
+`CONFIG_DEVEL=y` + `CONFIG_CCACHE=y` 成对写（DEVEL 只影响菜单可见性，不改别的默认值）。
+
+顺带按这一轮的实际数据做的几处调整：
+
+1. **ccache 自检升级**：不再只看"目录非空"，改用 `ccache --print-stats` 报**命中率**
+   （`::notice::ccache 生效：缓存 3G，本次命中 1234 次 / 未命中 56 次（命中率 96%）`）。
+   命中率是唯一能证明缓存真的接上的数字。
+2. **新增 `source_commit` 输入**：把「已经刷过、确认能用」的那个上游 commit 钉住。
+   以前只能钉 tag，而 tag 不一定有；现在填 SHA 即可重现同一份固件。
+   填错会在 clone 阶段 10 秒内报错，不浪费一次 90 分钟。
+3. **`release` 输入保留但默认仍是 false**：勾上才发 Release（artifact 14 天过期、下载要登录、
+   还是 zip 套娃；Release 里是直接的 `.img.gz`）。默认不发，避免每轮都自动建 Release。
+4. **并行度**：`make download -j8 → -j16`（这一步纯 IO，实测 13 分钟）；
+   `make -j$(nproc) → -j$(nproc+1)`（编译里总有等 IO/flock 的空档）。
+5. **Summary 增列** `CONFIG_DEVEL` / `CONFIG_CCACHE` 两个生效值，一眼能看出缓存有没有接上。
+
+> 注意：这一轮没吃到缓存，所以**下一轮仍然是全量编译**（第一次会把缓存建起来），
+> 再下一轮才会明显变快。这是 ccache 的正常节奏，不是配置问题。
+
+**止损规则（已定，不再反复试）**：下一轮跑完只看一条判据 —— annotation 里有没有
+`::notice::ccache 生效：… 命中率 X%` 且 `X` 不为 0。
+
+- 有 → 收工，以后不用管这件事。
+- 没有（还是 `::warning::.config 里没有 CONFIG_CCACHE=y` 或命中率 0）→ **把 ccache 整套删掉**，
+  别再来回折腾。要删的东西：workflow 里 `Restore ccache` / `Report ccache stats` /
+  `Check ccache is really used` / `Save ccache` 四个 step、`use_ccache` 输入、
+  `Resolve parameters` 里的 `USE_CCACHE`，以及 `config/base.config` 里的
+  `CONFIG_DEVEL=y` + `CONFIG_CCACHE=y` 和 `env.CCACHE_DIR` / `CCACHE_MAXSIZE`。
+  删完就是「每轮全量编译 1h46m」，功能不受任何影响。
+
 ---
 
 ## 3. 迁移步骤
